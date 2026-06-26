@@ -1,0 +1,21 @@
+/vendor/
+/.phpunit.cache/
+.phpunit.result.cache
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Worker runtime files
+*.pid
+*.pid.lock
+*.status
+*.status.connection
+reactphp-x-worker.log
+workerman.log
