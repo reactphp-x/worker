@@ -556,10 +556,40 @@ class Worker
             return;
         }
         pcntl_async_signals(true);
-        foreach ([SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGUSR1, SIGUSR2, SIGIOT, SIGIO] as $signal) {
+        foreach (static::getWorkerSignals() as $signal) {
             pcntl_signal($signal, static::signalHandler(...), true);
         }
         pcntl_signal(SIGPIPE, SIG_IGN, false);
+    }
+
+    /**
+     * Register worker signal handlers on a React event loop (preferred when a loop is active).
+     */
+    protected static function installLoopSignal(object $loop): void
+    {
+        if (DIRECTORY_SEPARATOR !== '/' || !method_exists($loop, 'addSignal')) {
+            static::installSignal();
+            return;
+        }
+
+        pcntl_async_signals(true);
+        pcntl_signal(SIGPIPE, SIG_IGN, false);
+
+        foreach (static::getWorkerSignals() as $signal) {
+            try {
+                $loop->addSignal($signal, static function () use ($signal): void {
+                    static::signalHandler($signal);
+                });
+            } catch (Throwable) {
+                pcntl_signal($signal, static::signalHandler(...), true);
+            }
+        }
+    }
+
+    /** @return list<int> */
+    protected static function getWorkerSignals(): array
+    {
+        return [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGUSR1, SIGUSR2, SIGIOT, SIGIO];
     }
 
     protected static function signalHandler(int $signal): void
@@ -1108,8 +1138,6 @@ class Worker
             throw new RuntimeException('Worker handler is not set');
         }
 
-        static::installSignal();
-
         try {
             ($this->handler)($this);
         } catch (Throwable $e) {
@@ -1126,19 +1154,7 @@ class Worker
     {
         $loop = static::getReactEventLoop();
         if ($loop !== null) {
-            if (method_exists($loop, 'addSignal')) {
-                $stopHandler = static function (): void {
-                    static::stopAll(0, 'received signal in event loop');
-                };
-                foreach ([SIGINT, SIGTERM, SIGQUIT, SIGHUP] as $signal) {
-                    try {
-                        $loop->addSignal($signal, $stopHandler);
-                    } catch (Throwable) {
-                        // loop backend may not support this signal
-                    }
-                }
-            }
-
+            static::installLoopSignal($loop);
             $loop->run();
 
             if (static::$status === static::STATUS_SHUTDOWN || $this->stopping) {
@@ -1146,6 +1162,7 @@ class Worker
             }
         }
 
+        static::installSignal();
         while (static::$status !== static::STATUS_SHUTDOWN && !$this->stopping) {
             pcntl_signal_dispatch();
             usleep(100_000);
