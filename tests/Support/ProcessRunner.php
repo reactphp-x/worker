@@ -44,6 +44,7 @@ final class ProcessRunner
         $stdout = '';
         $stderr = '';
         $deadline = microtime(true) + $timeoutSeconds;
+        $exitCode = -1;
 
         while (true) {
             $stdout .= (string) stream_get_contents($pipes[1]);
@@ -53,6 +54,7 @@ final class ProcessRunner
             if (!$status['running']) {
                 $stdout .= (string) stream_get_contents($pipes[1]);
                 $stderr .= (string) stream_get_contents($pipes[2]);
+                $exitCode = $status['exitcode'];
                 break;
             }
 
@@ -66,7 +68,7 @@ final class ProcessRunner
 
         fclose($pipes[1]);
         fclose($pipes[2]);
-        $exitCode = proc_close($process);
+        proc_close($process);
 
         return new ProcessResult($stdout, $stderr, $exitCode);
     }

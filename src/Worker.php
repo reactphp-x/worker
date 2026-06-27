@@ -71,6 +71,7 @@ class Worker
     public static string $logFile = '';
     public static int $logFileMaxSize = 10_485_760;
     public static int $stopTimeout = 2;
+    public static int $gracefulStopTimeout = 30;
     public static string $command = '';
 
     /** @var ?callable(): void */
@@ -93,6 +94,7 @@ class Worker
     protected static string $connectionsFile = '';
     protected static string $startFile = '';
     protected static bool $gracefulStop = false;
+    protected static int $shutdownStartedAt = 0;
     protected static bool $outputDecorated;
     protected static array $globalStatistics = [
         'start_timestamp' => 0,
@@ -435,16 +437,20 @@ class Worker
                     static::log("reactphp-x-worker[$startFile] is stopping ...");
                 }
                 $masterPid && posix_kill($masterPid, $sig);
-                $timeout = static::$stopTimeout + 3;
+                $timeout = static::getGracefulStop()
+                    ? static::$gracefulStopTimeout
+                    : static::$stopTimeout + 3;
                 $startTime = time();
                 while (1) {
-                    $masterIsAlive = $masterPid && posix_kill($masterPid, 0);
+                    $masterIsAlive = $masterPid && static::checkMasterIsAlive($masterPid);
                     if ($masterIsAlive) {
-                        if (!static::getGracefulStop() && time() - $startTime >= $timeout) {
-                            static::log("reactphp-x-worker[$startFile] stop fail");
-                            exit;
+                        if (time() - $startTime >= $timeout) {
+                            posix_kill($masterPid, SIGKILL);
+                            usleep(100000);
+                            static::log("reactphp-x-worker[$startFile] stop fail (timeout {$timeout}s)");
+                            exit(1);
                         }
-                        usleep(10000);
+                        usleep(100000);
                         continue;
                     }
                     static::log("reactphp-x-worker[$startFile] stop success");
@@ -549,8 +555,9 @@ class Worker
         if (DIRECTORY_SEPARATOR !== '/') {
             return;
         }
+        pcntl_async_signals(true);
         foreach ([SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGUSR1, SIGUSR2, SIGIOT, SIGIO] as $signal) {
-            pcntl_signal($signal, static::signalHandler(...), false);
+            pcntl_signal($signal, static::signalHandler(...), true);
         }
         pcntl_signal(SIGPIPE, SIG_IGN, false);
     }
@@ -780,10 +787,16 @@ class Worker
         static::$status = static::STATUS_RUNNING;
         while (true) {
             pcntl_signal_dispatch();
-            $status = 0;
-            $pid = pcntl_wait($status, WUNTRACED);
-            pcntl_signal_dispatch();
-            if ($pid > 0) {
+            while (true) {
+                $status = 0;
+                $pid = pcntl_wait($status, WUNTRACED | WNOHANG);
+                pcntl_signal_dispatch();
+                if ($pid === -1) {
+                    break;
+                }
+                if ($pid === 0) {
+                    break;
+                }
                 foreach (static::$pidMap as $workerId => $workerPidArray) {
                     if (!isset($workerPidArray[$pid])) {
                         continue;
@@ -821,6 +834,33 @@ class Worker
             }
             if (static::$status === static::STATUS_SHUTDOWN && static::getAllWorkerPids() === []) {
                 static::exitAndClearAll();
+            }
+
+            if (static::$status === static::STATUS_SHUTDOWN) {
+                static::forceKillWorkersIfTimeout();
+            }
+
+            usleep(100_000);
+        }
+    }
+
+    protected static function forceKillWorkersIfTimeout(): void
+    {
+        if (static::$shutdownStartedAt === 0) {
+            return;
+        }
+
+        $timeout = static::getGracefulStop()
+            ? static::$gracefulStopTimeout
+            : static::$stopTimeout + 3;
+
+        if (time() - static::$shutdownStartedAt < $timeout) {
+            return;
+        }
+
+        foreach (static::getAllWorkerPids() as $workerPid) {
+            if (posix_kill($workerPid, 0)) {
+                posix_kill($workerPid, SIGKILL);
             }
         }
     }
@@ -902,6 +942,9 @@ class Worker
     {
         static::$status = static::STATUS_SHUTDOWN;
         if (DIRECTORY_SEPARATOR === '/' && static::$masterPid === posix_getpid()) {
+            if (static::$shutdownStartedAt === 0) {
+                static::$shutdownStartedAt = time();
+            }
             if ($log) {
                 static::log('reactphp-x-worker[' . basename(static::$startFile) . "] $log");
             }
@@ -909,12 +952,6 @@ class Worker
             $sig = static::getGracefulStop() ? SIGQUIT : SIGINT;
             foreach (static::getAllWorkerPids() as $workerPid) {
                 posix_kill($workerPid, $sig);
-                if (!static::getGracefulStop()) {
-                    pcntl_signal(SIGALRM, static function () use ($workerPid): void {
-                        posix_kill($workerPid, SIGKILL);
-                    }, false);
-                    pcntl_alarm(static::$stopTimeout);
-                }
             }
             return;
         }
@@ -1089,7 +1126,24 @@ class Worker
     {
         $loop = static::getReactEventLoop();
         if ($loop !== null) {
+            if (method_exists($loop, 'addSignal')) {
+                $stopHandler = static function (): void {
+                    static::stopAll(0, 'received signal in event loop');
+                };
+                foreach ([SIGINT, SIGTERM, SIGQUIT, SIGHUP] as $signal) {
+                    try {
+                        $loop->addSignal($signal, $stopHandler);
+                    } catch (Throwable) {
+                        // loop backend may not support this signal
+                    }
+                }
+            }
+
             $loop->run();
+
+            if (static::$status === static::STATUS_SHUTDOWN || $this->stopping) {
+                exit(0);
+            }
         }
 
         while (static::$status !== static::STATUS_SHUTDOWN && !$this->stopping) {
@@ -1129,6 +1183,10 @@ class Worker
             } catch (Throwable $e) {
                 static::log($e);
             }
+        }
+        $loop = static::getReactEventLoop();
+        if ($loop !== null && method_exists($loop, 'stop')) {
+            $loop->stop();
         }
         $this->handler = null;
         $this->stopping = true;
