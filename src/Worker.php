@@ -1087,10 +1087,35 @@ class Worker
 
     protected function waitUntilStop(): void
     {
+        $loop = static::getReactEventLoop();
+        if ($loop !== null) {
+            $loop->run();
+        }
+
         while (static::$status !== static::STATUS_SHUTDOWN && !$this->stopping) {
             pcntl_signal_dispatch();
             usleep(100_000);
         }
+    }
+
+    /**
+     * Returns the React event loop if react/event-loop is installed and already initialized.
+     * Does not create a loop instance (unlike Loop::get()).
+     */
+    protected static function getReactEventLoop(): ?object
+    {
+        if (!class_exists(\React\EventLoop\Loop::class, false)) {
+            return null;
+        }
+
+        $reflection = new \ReflectionClass(\React\EventLoop\Loop::class);
+        if (!$reflection->hasProperty('instance')) {
+            return null;
+        }
+
+        $instance = $reflection->getProperty('instance')->getValue();
+
+        return $instance !== null ? $instance : null;
     }
 
     public function stop(bool $force = true): void
