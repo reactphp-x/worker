@@ -251,6 +251,12 @@ class Worker
                 $key = 'max' . ucfirst(strtolower($columnName)) . 'NameLength';
                 static::$uiLengthData[$key] = max(static::$uiLengthData[$key] ?? 2 * static::UI_SAFE_LENGTH, strlen($value));
             }
+
+            $listen = static::getWorkerListenName($worker);
+            static::$uiLengthData['maxListenNameLength'] = max(
+                static::$uiLengthData['maxListenNameLength'] ?? 2 * static::UI_SAFE_LENGTH,
+                strlen($listen),
+            );
         }
     }
 
@@ -406,14 +412,16 @@ class Worker
                 }
                 break;
             case 'status':
-                register_shutdown_function(unlink(...), static::$statisticsFile);
                 while (1) {
+                    if (is_file(static::$statisticsFile)) {
+                        @unlink(static::$statisticsFile);
+                    }
                     posix_kill($masterPid, SIGIOT);
                     sleep(1);
                     if ($mode === '-d') {
                         static::safeEcho("\33[H\33[2J\33(B\33[m", true);
                     }
-                    static::safeEcho(static::formatProcessStatusData());
+                    static::safeEcho(static::formatStatusData(static::$statisticsFile));
                     if ($mode !== '-d') {
                         exit(0);
                     }
@@ -480,17 +488,21 @@ class Worker
         return static::$command ? [...$argv, ...explode(' ', static::$command)] : $argv;
     }
 
-    protected static function formatProcessStatusData(): string
+    protected static function formatStatusData(string $statisticsFile): string
     {
-        if (!is_readable(static::$statisticsFile)) {
+        static $totalRequestCache = [];
+
+        if (!is_readable($statisticsFile)) {
             return '';
         }
-        $info = file(static::$statisticsFile, FILE_IGNORE_NEW_LINES);
+
+        $info = file($statisticsFile, FILE_IGNORE_NEW_LINES);
         if (!$info) {
             return '';
         }
 
         $statusStr = '';
+        $currentTotalRequest = [];
         $workerInfo = [];
         try {
             $workerInfo = unserialize($info[0], ['allowed_classes' => false]);
@@ -504,13 +516,19 @@ class Worker
 
         $dataWaitingSort = [];
         $readProcessStatus = false;
+        $totalRequests = 0;
+        $totalQps = 0;
+        $totalConnections = 0;
+        $totalFails = 0;
         $totalMemory = 0;
-        $maxLen = max(static::getUiColumnLength('maxWorkerNameLength'), 2 * static::UI_SAFE_LENGTH);
+        $totalTimers = 0;
+        $maxLen1 = max(static::getUiColumnLength('maxListenNameLength'), 2 * static::UI_SAFE_LENGTH);
+        $maxLen2 = max(static::getUiColumnLength('maxWorkerNameLength'), 2 * static::UI_SAFE_LENGTH);
 
         foreach ($info as $value) {
             if (!$readProcessStatus) {
                 $statusStr .= $value . "\n";
-                if (preg_match('/^pid.*?memory.*?name/', $value)) {
+                if (preg_match('/^pid.*?memory.*?listening/', $value)) {
                     $readProcessStatus = true;
                 }
                 continue;
@@ -518,9 +536,15 @@ class Worker
             if (preg_match('/^[0-9]+/', $value, $pidMatch)) {
                 $pid = $pidMatch[0];
                 $dataWaitingSort[$pid] = $value;
-                if (preg_match('/^\S+?\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?/', $value, $match)) {
-                    $totalMemory += (float) str_ireplace('M', '', $match[1]);
-                    $maxLen = max($maxLen, strlen($match[2]));
+                if (preg_match('/^\S+?\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?/', $value, $match)) {
+                    $totalMemory += (int) str_ireplace('M', '', $match[1]);
+                    $maxLen1 = max($maxLen1, strlen($match[2]));
+                    $maxLen2 = max($maxLen2, strlen($match[3]));
+                    $totalConnections += (int) $match[4];
+                    $totalFails += (int) $match[5];
+                    $totalTimers += (int) $match[6];
+                    $currentTotalRequest[$pid] = $match[7];
+                    $totalRequests += (int) $match[7];
                 }
             }
         }
@@ -528,17 +552,30 @@ class Worker
         foreach ($workerInfo as $pid => $infoItem) {
             if (!isset($dataWaitingSort[$pid])) {
                 $statusStr .= "$pid\t" . str_pad('N/A', 7) . ' '
-                    . str_pad((string) $infoItem['name'], $maxLen) . ' '
-                    . str_pad('N/A', 7) . " N/A    [busy]\n";
+                    . str_pad((string) ($infoItem['listen'] ?? 'none'), $maxLen1) . ' '
+                    . str_pad((string) ($infoItem['name'] ?? 'none'), $maxLen2) . ' '
+                    . str_pad('N/A', 11) . ' ' . str_pad('N/A', 9) . ' '
+                    . str_pad('N/A', 7) . ' ' . str_pad('N/A', 13) . " N/A    [busy] \n";
                 continue;
             }
-            $statusStr .= $dataWaitingSort[$pid] . " [idle]\n";
+            if (!isset($totalRequestCache[$pid]) || !isset($currentTotalRequest[$pid])) {
+                $qps = 0;
+            } else {
+                $qps = (int) $currentTotalRequest[$pid] - (int) $totalRequestCache[$pid];
+                $totalQps += $qps;
+            }
+            $statusStr .= $dataWaitingSort[$pid] . ' ' . str_pad((string) $qps, 6) . " [idle]\n";
         }
+        $totalRequestCache = $currentTotalRequest;
 
         $statusStr .= "---------------------------------------------------PROCESS STATUS--------------------------------------------------------\n";
         $statusStr .= 'Summary' . "\t" . str_pad($totalMemory . 'M', 7) . ' '
-            . str_pad('-', $maxLen) . ' '
-            . str_pad((string) count($workerInfo), 7) . " [Summary]\n";
+            . str_pad('-', $maxLen1) . ' '
+            . str_pad('-', $maxLen2) . ' '
+            . str_pad((string) $totalConnections, 11) . ' ' . str_pad((string) $totalFails, 9) . ' '
+            . str_pad((string) $totalTimers, 7) . ' ' . str_pad((string) $totalRequests, 13) . ' '
+            . str_pad((string) $totalQps, 6) . " [Summary] \n";
+
         return $statusStr;
     }
 
@@ -1006,6 +1043,51 @@ class Worker
         return static::$gracefulStop;
     }
 
+    protected static function getWorkerListenName(self $worker): string
+    {
+        $listen = (string) ($worker->context->listen ?? '');
+
+        return $listen !== '' ? $listen : 'none';
+    }
+
+    /** @return array{connection_count: int, send_fail: int, total_request: int} */
+    protected static function getWorkerStatistics(self $worker): array
+    {
+        $statistics = $worker->context->statistics ?? null;
+
+        if (is_object($statistics)) {
+            return [
+                'connection_count' => (int) ($statistics->connection_count ?? 0),
+                'send_fail' => (int) ($statistics->send_fail ?? 0),
+                'total_request' => (int) ($statistics->total_request ?? 0),
+            ];
+        }
+
+        if (is_array($statistics)) {
+            return [
+                'connection_count' => (int) ($statistics['connection_count'] ?? 0),
+                'send_fail' => (int) ($statistics['send_fail'] ?? 0),
+                'total_request' => (int) ($statistics['total_request'] ?? 0),
+            ];
+        }
+
+        return [
+            'connection_count' => 0,
+            'send_fail' => 0,
+            'total_request' => 0,
+        ];
+    }
+
+    protected static function getWorkerTimerCount(): int
+    {
+        $loop = static::getReactEventLoop();
+        if ($loop !== null && method_exists($loop, 'getTimerCount')) {
+            return (int) $loop->getTimerCount();
+        }
+
+        return 0;
+    }
+
     protected static function writeStatisticsToStatusFile(): void
     {
         if (static::$masterPid === posix_getpid()) {
@@ -1013,7 +1095,10 @@ class Worker
             foreach (static::$pidMap as $workerId => $pidArray) {
                 $worker = static::$workers[$workerId];
                 foreach ($pidArray as $pid) {
-                    $allWorkerInfo[$pid] = ['name' => $worker->name];
+                    $allWorkerInfo[$pid] = [
+                        'name' => $worker->name,
+                        'listen' => static::getWorkerListenName($worker),
+                    ];
                 }
             }
             file_put_contents(static::$statisticsFile, '');
@@ -1050,20 +1135,37 @@ class Worker
             file_put_contents(static::$statisticsFile,
                 "---------------------------------------------------PROCESS STATUS--------------------------------------------------------\n", FILE_APPEND);
             file_put_contents(static::$statisticsFile,
-                "pid\tmemory  " . str_pad('name', static::getUiColumnLength('maxWorkerNameLength'))
-                . " timers  status\n", FILE_APPEND);
+                "pid\tmemory  " . str_pad('listening', static::getUiColumnLength('maxListenNameLength'))
+                . ' ' . str_pad('worker_name', static::getUiColumnLength('maxWorkerNameLength'))
+                . ' connections ' . str_pad('send_fail', 9) . ' '
+                . str_pad('timers', 8) . str_pad('total_request', 13) . " qps    status\n", FILE_APPEND);
             foreach (static::getAllWorkerPids() as $workerPid) {
                 posix_kill($workerPid, SIGIOT);
             }
             return;
         }
 
+        if (function_exists('gc_collect_cycles')) {
+            gc_collect_cycles();
+        }
+        if (function_exists('gc_mem_caches')) {
+            gc_mem_caches();
+        }
+
         reset(static::$workers);
         /** @var self $worker */
         $worker = current(static::$workers);
-        $workerStatusStr = posix_getpid() . "\t" . str_pad(round(memory_get_usage() / (1024 * 1024), 2) . 'M', 7)
-            . ' ' . str_pad($worker->name, static::getUiColumnLength('maxWorkerNameLength'))
-            . ' ' . str_pad('0', 7) . "\n";
+        $listen = static::getWorkerListenName($worker);
+        $workerName = $worker->name === $listen ? 'none' : $worker->name;
+        $statistics = static::getWorkerStatistics($worker);
+        $workerStatusStr = posix_getpid() . "\t" . str_pad(round(memory_get_usage(false) / (1024 * 1024), 2) . 'M', 7)
+            . ' ' . str_pad($listen, static::getUiColumnLength('maxListenNameLength'))
+            . ' ' . str_pad($workerName, static::getUiColumnLength('maxWorkerNameLength'))
+            . ' ';
+        $workerStatusStr .= str_pad((string) $statistics['connection_count'], 11)
+            . ' ' . str_pad((string) $statistics['send_fail'], 9)
+            . ' ' . str_pad((string) static::getWorkerTimerCount(), 7)
+            . ' ' . str_pad((string) $statistics['total_request'], 13) . "\n";
         file_put_contents(static::$statisticsFile, $workerStatusStr, FILE_APPEND);
     }
 
