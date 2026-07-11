@@ -120,6 +120,33 @@ class Worker
         static::$pidMap[$this->workerId] = [];
     }
 
+    public function setListen(string $listen): void
+    {
+        $this->context->listen = $listen;
+    }
+
+    /** @return object{connection_count: int, send_fail: int, total_request: int} */
+    public function statistics(): object
+    {
+        if (isset($this->context->statistics) && is_object($this->context->statistics)) {
+            return $this->context->statistics;
+        }
+
+        $this->context->statistics = (object) [
+            'connection_count' => 0,
+            'send_fail' => 0,
+            'total_request' => 0,
+        ];
+
+        return $this->context->statistics;
+    }
+
+    /** @param list<string> $lines */
+    public function setConnectionStatusLines(array $lines): void
+    {
+        $this->context->connectionStatusLines = $lines;
+    }
+
     public static function runAll(): void
     {
         try {
@@ -1177,7 +1204,7 @@ class Worker
             file_put_contents(static::$connectionsFile,
                 "--------------------------------------------------------------------- REACTPHP-X-WORKER CONNECTION STATUS --------------------------------------------------------------------------------\n", FILE_APPEND);
             file_put_contents(static::$connectionsFile,
-                "PID      Worker          Status\n", FILE_APPEND);
+                "PID      Worker          CID       Type    Status        Remote Address\n", FILE_APPEND);
             foreach (static::getAllWorkerPids() as $workerPid) {
                 posix_kill($workerPid, SIGIO);
             }
@@ -1187,6 +1214,12 @@ class Worker
         reset(static::$workers);
         /** @var self $worker */
         $worker = current(static::$workers);
+        $connectionStatusLines = $worker->context->connectionStatusLines ?? null;
+        if (is_array($connectionStatusLines) && $connectionStatusLines !== []) {
+            file_put_contents(static::$connectionsFile, implode('', $connectionStatusLines), FILE_APPEND);
+            return;
+        }
+
         file_put_contents(static::$connectionsFile,
             str_pad((string) posix_getpid(), 9) . str_pad($worker->name, 16) . "running\n", FILE_APPEND);
     }
