@@ -44,6 +44,13 @@ class Worker
 
     public const UI_SAFE_LENGTH = 4;
 
+    private const STATUS_COL_CONNECTIONS = 11;
+    private const STATUS_COL_SEND_FAIL = 9;
+    private const STATUS_COL_TIMERS = 7;
+    private const STATUS_COL_TOTAL_REQUEST = 13;
+    private const STATUS_COL_QPS = 6;
+    private const STATUS_COL_MEMORY = 7;
+
     public int $id = 0;
     public string $name = 'none';
     public int $count = 1;
@@ -528,8 +535,6 @@ class Worker
             return '';
         }
 
-        $statusStr = '';
-        $currentTotalRequest = [];
         $workerInfo = [];
         try {
             $workerInfo = unserialize($info[0], ['allowed_classes' => false]);
@@ -541,69 +546,261 @@ class Worker
         ksort($workerInfo, SORT_NUMERIC);
         unset($info[0]);
 
-        $dataWaitingSort = [];
+        $preamble = [];
+        $rawRows = [];
         $readProcessStatus = false;
+
+        foreach ($info as $value) {
+            if (!$readProcessStatus) {
+                if (preg_match('/^pid.*?memory.*?listening/', $value)) {
+                    $readProcessStatus = true;
+                    continue;
+                }
+                $preamble[] = $value;
+                continue;
+            }
+            if (preg_match('/^(\d+)/', $value, $pidMatch)) {
+                $rawRows[$pidMatch[0]] = $value;
+            }
+        }
+
+        $parsedRows = [];
+        foreach ($rawRows as $pid => $line) {
+            $parsed = static::parseProcessStatusLine($line, $workerInfo[(int) $pid] ?? $workerInfo[$pid] ?? []);
+            if ($parsed !== null) {
+                $parsedRows[$pid] = $parsed;
+            }
+        }
+
+        $widths = static::getProcessStatusColumnWidths($workerInfo, $parsedRows);
+        $statusStr = implode("\n", $preamble) . ($preamble !== [] ? "\n" : '');
+        $statusStr .= "---------------------------------------------------PROCESS STATUS--------------------------------------------------------\n";
+        $statusStr .= static::formatProcessStatusHeader($widths);
+
         $totalRequests = 0;
         $totalQps = 0;
         $totalConnections = 0;
         $totalFails = 0;
         $totalMemory = 0;
         $totalTimers = 0;
-        $maxLen1 = max(static::getUiColumnLength('maxListenNameLength'), 2 * static::UI_SAFE_LENGTH);
-        $maxLen2 = max(static::getUiColumnLength('maxWorkerNameLength'), 2 * static::UI_SAFE_LENGTH);
-
-        foreach ($info as $value) {
-            if (!$readProcessStatus) {
-                $statusStr .= $value . "\n";
-                if (preg_match('/^pid.*?memory.*?listening/', $value)) {
-                    $readProcessStatus = true;
-                }
-                continue;
-            }
-            if (preg_match('/^[0-9]+/', $value, $pidMatch)) {
-                $pid = $pidMatch[0];
-                $dataWaitingSort[$pid] = $value;
-                if (preg_match('/^\S+?\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?/', $value, $match)) {
-                    $totalMemory += (int) str_ireplace('M', '', $match[1]);
-                    $maxLen1 = max($maxLen1, strlen($match[2]));
-                    $maxLen2 = max($maxLen2, strlen($match[3]));
-                    $totalConnections += (int) $match[4];
-                    $totalFails += (int) $match[5];
-                    $totalTimers += (int) $match[6];
-                    $currentTotalRequest[$pid] = $match[7];
-                    $totalRequests += (int) $match[7];
-                }
-            }
-        }
 
         foreach ($workerInfo as $pid => $infoItem) {
-            if (!isset($dataWaitingSort[$pid])) {
-                $statusStr .= "$pid\t" . str_pad('N/A', 7) . ' '
-                    . str_pad((string) ($infoItem['listen'] ?? 'none'), $maxLen1) . ' '
-                    . str_pad((string) ($infoItem['name'] ?? 'none'), $maxLen2) . ' '
-                    . str_pad('N/A', 11) . ' ' . str_pad('N/A', 9) . ' '
-                    . str_pad('N/A', 7) . ' ' . str_pad('N/A', 13) . " N/A    [busy] \n";
+            $pid = (string) $pid;
+            if (!isset($parsedRows[$pid])) {
+                $statusStr .= static::formatProcessStatusRow(
+                    $pid,
+                    'N/A',
+                    (string) ($infoItem['listen'] ?? 'none'),
+                    (string) ($infoItem['name'] ?? 'none'),
+                    'N/A',
+                    'N/A',
+                    'N/A',
+                    'N/A',
+                    'N/A',
+                    '[busy]',
+                    $widths,
+                );
                 continue;
             }
-            if (!isset($totalRequestCache[$pid]) || !isset($currentTotalRequest[$pid])) {
+
+            $row = $parsedRows[$pid];
+            $totalMemory += (int) str_ireplace('M', '', $row['memory']);
+            $totalConnections += (int) $row['connections'];
+            $totalFails += (int) $row['send_fail'];
+            $totalTimers += (int) $row['timers'];
+            $totalRequests += (int) $row['total_request'];
+
+            if (!isset($totalRequestCache[$pid])) {
                 $qps = 0;
             } else {
-                $qps = (int) $currentTotalRequest[$pid] - (int) $totalRequestCache[$pid];
+                $qps = (int) $row['total_request'] - (int) $totalRequestCache[$pid];
                 $totalQps += $qps;
             }
-            $statusStr .= $dataWaitingSort[$pid] . ' ' . str_pad((string) $qps, 6) . " [idle]\n";
+
+            $statusStr .= static::formatProcessStatusRow(
+                $pid,
+                $row['memory'],
+                $row['listen'],
+                $row['worker'],
+                $row['connections'],
+                $row['send_fail'],
+                $row['timers'],
+                $row['total_request'],
+                (string) $qps,
+                '[idle]',
+                $widths,
+            );
         }
-        $totalRequestCache = $currentTotalRequest;
+        $totalRequestCache = array_map(static fn (array $row): string => $row['total_request'], $parsedRows);
 
         $statusStr .= "---------------------------------------------------PROCESS STATUS--------------------------------------------------------\n";
-        $statusStr .= 'Summary' . "\t" . str_pad($totalMemory . 'M', 7) . ' '
-            . str_pad('-', $maxLen1) . ' '
-            . str_pad('-', $maxLen2) . ' '
-            . str_pad((string) $totalConnections, 11) . ' ' . str_pad((string) $totalFails, 9) . ' '
-            . str_pad((string) $totalTimers, 7) . ' ' . str_pad((string) $totalRequests, 13) . ' '
-            . str_pad((string) $totalQps, 6) . " [Summary] \n";
+        $statusStr .= static::formatProcessStatusRow(
+            'Summary',
+            $totalMemory . 'M',
+            '-',
+            '-',
+            (string) $totalConnections,
+            (string) $totalFails,
+            (string) $totalTimers,
+            (string) $totalRequests,
+            (string) $totalQps,
+            '[Summary]',
+            $widths,
+        );
 
         return $statusStr;
+    }
+
+    /**
+     * @param array<string, mixed> $workerInfoItem
+     * @return ?array{memory: string, listen: string, worker: string, connections: string, send_fail: string, timers: string, total_request: string}
+     */
+    protected static function parseProcessStatusLine(string $line, array $workerInfoItem): ?array
+    {
+        if (!preg_match(
+            '/^(\d+)\t(\S+)\s+(.+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/',
+            $line,
+            $match,
+        )) {
+            return null;
+        }
+
+        $workerName = (string) ($workerInfoItem['name'] ?? '');
+        $middle = trim($match[3]);
+
+        if ($workerName !== '' && str_ends_with($middle, $workerName)) {
+            $listen = trim(substr($middle, 0, -strlen($workerName)));
+        } else {
+            $parts = preg_split('/\s+/', $middle, 2) ?: [];
+            $listen = $parts[0] ?? 'none';
+            $workerName = $parts[1] ?? ($workerName !== '' ? $workerName : 'none');
+        }
+
+        if ($listen === '') {
+            $listen = (string) ($workerInfoItem['listen'] ?? 'none');
+        }
+
+        return [
+            'memory' => $match[2],
+            'listen' => $listen,
+            'worker' => $workerName,
+            'connections' => $match[4],
+            'send_fail' => $match[5],
+            'timers' => $match[6],
+            'total_request' => $match[7],
+        ];
+    }
+
+    /**
+     * @param array<int|string, array<string, mixed>> $workerInfo
+     * @param array<int|string, array{memory: string, listen: string, worker: string, connections: string, send_fail: string, timers: string, total_request: string}> $parsedRows
+     * @return array{listen: int, worker: int, connections: int, send_fail: int, timers: int, total_request: int, qps: int}
+     */
+    protected static function getProcessStatusColumnWidths(array $workerInfo, array $parsedRows): array
+    {
+        $listenWidth = strlen('listening');
+        $workerWidth = strlen('worker_name');
+
+        foreach ($workerInfo as $infoItem) {
+            $listenWidth = max($listenWidth, strlen((string) ($infoItem['listen'] ?? 'none')));
+            $workerWidth = max($workerWidth, strlen((string) ($infoItem['name'] ?? 'none')));
+        }
+
+        foreach ($parsedRows as $row) {
+            $listenWidth = max($listenWidth, strlen($row['listen']));
+            $workerWidth = max($workerWidth, strlen($row['worker']));
+        }
+
+        return [
+            'listen' => max($listenWidth, 2 * static::UI_SAFE_LENGTH),
+            'worker' => max($workerWidth, 2 * static::UI_SAFE_LENGTH),
+            'connections' => static::STATUS_COL_CONNECTIONS,
+            'send_fail' => static::STATUS_COL_SEND_FAIL,
+            'timers' => static::STATUS_COL_TIMERS,
+            'total_request' => static::STATUS_COL_TOTAL_REQUEST,
+            'qps' => static::STATUS_COL_QPS,
+        ];
+    }
+
+    /** @param array{listen: int, worker: int, connections: int, send_fail: int, timers: int, total_request: int, qps: int} $widths */
+    protected static function formatProcessStatusHeader(array $widths): string
+    {
+        return 'pid' . "\t" . static::formatStatusCell('memory', static::STATUS_COL_MEMORY) . '  '
+            . static::formatStatusCell('listening', $widths['listen']) . ' '
+            . static::formatStatusCell('worker_name', $widths['worker']) . ' '
+            . static::formatStatusCell('connections', $widths['connections']) . ' '
+            . static::formatStatusCell('send_fail', $widths['send_fail']) . ' '
+            . static::formatStatusCell('timers', $widths['timers']) . ' '
+            . static::formatStatusCell('total_request', $widths['total_request']) . ' '
+            . static::formatStatusCell('qps', $widths['qps']) . ' '
+            . "status\n";
+    }
+
+    /** @param array{listen: int, worker: int, connections: int, send_fail: int, timers: int, total_request: int, qps: int} $widths */
+    protected static function formatProcessStatusDataRow(
+        int|string $pid,
+        string $memory,
+        string $listen,
+        string $workerName,
+        string $connections,
+        string $sendFail,
+        string $timers,
+        string $totalRequest,
+        array $widths,
+    ): string {
+        return $pid . "\t" . static::formatStatusCell($memory, static::STATUS_COL_MEMORY) . '  '
+            . static::formatStatusCell($listen, $widths['listen']) . ' '
+            . static::formatStatusCell($workerName, $widths['worker']) . ' '
+            . static::formatStatusCell($connections, $widths['connections']) . ' '
+            . static::formatStatusCell($sendFail, $widths['send_fail']) . ' '
+            . static::formatStatusCell($timers, $widths['timers']) . ' '
+            . static::formatStatusCell($totalRequest, $widths['total_request']) . "\n";
+    }
+
+    /** @param array{listen: int, worker: int, connections: int, send_fail: int, timers: int, total_request: int, qps: int} $widths */
+    protected static function formatProcessStatusRow(
+        int|string $pid,
+        string $memory,
+        string $listen,
+        string $workerName,
+        string $connections,
+        string $sendFail,
+        string $timers,
+        string $totalRequest,
+        string $qps,
+        string $status,
+        array $widths,
+    ): string {
+        return $pid . "\t" . static::formatStatusCell($memory, static::STATUS_COL_MEMORY) . '  '
+            . static::formatStatusCell($listen, $widths['listen']) . ' '
+            . static::formatStatusCell($workerName, $widths['worker']) . ' '
+            . static::formatStatusCell($connections, $widths['connections']) . ' '
+            . static::formatStatusCell($sendFail, $widths['send_fail']) . ' '
+            . static::formatStatusCell($timers, $widths['timers']) . ' '
+            . static::formatStatusCell($totalRequest, $widths['total_request']) . ' '
+            . static::formatStatusCell($qps, $widths['qps']) . ' '
+            . $status . "\n";
+    }
+
+    protected static function formatStatusCell(string $value, int $width): string
+    {
+        if (strlen($value) > $width) {
+            return $width > 2 ? substr($value, 0, $width - 2) . '..' : substr($value, 0, $width);
+        }
+
+        return str_pad($value, $width);
+    }
+
+    /** @return array{listen: int, worker: int, connections: int, send_fail: int, timers: int, total_request: int, qps: int} */
+    protected static function getProcessStatusColumnWidthsForWorker(self $worker): array
+    {
+        $listen = static::getWorkerListenName($worker);
+        $workerName = $worker->name === $listen ? 'none' : $worker->name;
+
+        return static::getProcessStatusColumnWidths(
+            [['listen' => $listen, 'name' => $workerName]],
+            [['listen' => $listen, 'worker' => $workerName, 'memory' => '', 'connections' => '', 'send_fail' => '', 'timers' => '', 'total_request' => '']],
+        );
     }
 
     protected static function formatConnectionStatusData(): string
@@ -1161,11 +1358,14 @@ class Worker
             }
             file_put_contents(static::$statisticsFile,
                 "---------------------------------------------------PROCESS STATUS--------------------------------------------------------\n", FILE_APPEND);
-            file_put_contents(static::$statisticsFile,
-                "pid\tmemory  " . str_pad('listening', static::getUiColumnLength('maxListenNameLength'))
-                . ' ' . str_pad('worker_name', static::getUiColumnLength('maxWorkerNameLength'))
-                . ' connections ' . str_pad('send_fail', 9) . ' '
-                . str_pad('timers', 8) . str_pad('total_request', 13) . " qps    status\n", FILE_APPEND);
+            $statusWidths = static::getProcessStatusColumnWidths(
+                array_map(static fn (self $worker): array => [
+                    'listen' => static::getWorkerListenName($worker),
+                    'name' => $worker->name,
+                ], static::$workers),
+                [],
+            );
+            file_put_contents(static::$statisticsFile, static::formatProcessStatusHeader($statusWidths), FILE_APPEND);
             foreach (static::getAllWorkerPids() as $workerPid) {
                 posix_kill($workerPid, SIGIOT);
             }
@@ -1185,15 +1385,22 @@ class Worker
         $listen = static::getWorkerListenName($worker);
         $workerName = $worker->name === $listen ? 'none' : $worker->name;
         $statistics = static::getWorkerStatistics($worker);
-        $workerStatusStr = posix_getpid() . "\t" . str_pad(round(memory_get_usage(false) / (1024 * 1024), 2) . 'M', 7)
-            . ' ' . str_pad($listen, static::getUiColumnLength('maxListenNameLength'))
-            . ' ' . str_pad($workerName, static::getUiColumnLength('maxWorkerNameLength'))
-            . ' ';
-        $workerStatusStr .= str_pad((string) $statistics['connection_count'], 11)
-            . ' ' . str_pad((string) $statistics['send_fail'], 9)
-            . ' ' . str_pad((string) static::getWorkerTimerCount(), 7)
-            . ' ' . str_pad((string) $statistics['total_request'], 13) . "\n";
-        file_put_contents(static::$statisticsFile, $workerStatusStr, FILE_APPEND);
+        $widths = static::getProcessStatusColumnWidthsForWorker($worker);
+        file_put_contents(
+            static::$statisticsFile,
+            static::formatProcessStatusDataRow(
+                posix_getpid(),
+                round(memory_get_usage(false) / (1024 * 1024), 2) . 'M',
+                $listen,
+                $workerName,
+                (string) $statistics['connection_count'],
+                (string) $statistics['send_fail'],
+                (string) static::getWorkerTimerCount(),
+                (string) $statistics['total_request'],
+                $widths,
+            ),
+            FILE_APPEND,
+        );
     }
 
     protected static function writeConnectionsStatisticsToStatusFile(): void
